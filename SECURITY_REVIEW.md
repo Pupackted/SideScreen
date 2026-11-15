@@ -46,6 +46,9 @@ Verification:
 - Mac: `swift test` passes all 95 tests (85 existing + 10 new). The new ones include end-to-end loopback auth tests in `StreamingServerAuthTests`. The two profile-hold tests now authenticate first.
 - App: built with `scripts/build_mac.sh`, signed with an Apple Development identity, and launches under full hardened runtime.
 - Android: `testDebugUnitTest` passes (45 tests) and `assembleDebug` builds.
-- **Not yet tested end to end on a real tablet.**
+- **Tested end to end on a Xiaomi Pad 8 over USB (15 Nov 2026).**
+  - The token was delivered over adb. The Pad stored it in `no_backup/usb_auth_token` (0600, 32 bytes).
+  - The app passed `USB auth OK` and streamed HEVC at about 57 fps, with roughly 14 ms frame age and 0 drops.
+  - During the live session, a no-token client and a fake-token client from the tablet's shell were both rejected, and the stream did not drop.
 
 Compatibility: the Play Store / upstream Android app can no longer connect over USB to this Mac build, because it doesn't send the token. Install the fork's Android build (debug id `com.sidescreen.app.debug`).
