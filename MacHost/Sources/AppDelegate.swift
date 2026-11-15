@@ -477,7 +477,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 print("💡 No authorized Android device found — plug in via USB and allow debugging")
                 return
             }
+            // USB clients must authenticate too; hand each tablet the token
+            // over adb before (re)opening the bridge. Runs on every startup
+            // and replug, so a reinstalled tablet app picks it up again.
+            let usbToken = UsbAuth.loadOrCreate()
             for serial in serials {
+                UsbTokenPusher.push(adbPath: adbPath, serial: serial, token: usbToken)
                 if StatusDetector.adbReverseConfigured(port: Int(port), serial: serial) {
                     debugLog("ADB reverse already configured for \(serial)")
                     continue
@@ -596,6 +601,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Setup server
             streamingServer = StreamingServer(port: settings.port)
             streamingServer?.touchEnabled = settings.touchEnabled
+            streamingServer?.expectedUsbToken = UsbAuth.loadOrCreate()
             if settings.connectionMode == .wireless {
                 streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
                 configurePairingCode(on: streamingServer)

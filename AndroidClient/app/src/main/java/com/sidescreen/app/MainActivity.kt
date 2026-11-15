@@ -1603,6 +1603,10 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 val errorMessage =
                     when {
+                        e is StreamClient.UsbAuthException -> {
+                            e.message ?: "USB pairing failed."
+                        }
+
                         e.message?.contains("ECONNREFUSED") == true -> {
                             "Mac server is not running.\n\nPlease start Side Screen.app on your Mac first."
                         }

@@ -183,6 +183,12 @@ class StreamingServer {
     var expectedAuthToken: Data?
     var onWirelessClientPaired: ((String) -> Void)?
 
+    // USB auth: loopback (adb reverse) clients must present this token in the
+    // same SSWA handshake. nil rejects every loopback client — anything that
+    // can reach the port (other tablet apps, local processes) must not get the
+    // screen or inject input unauthenticated.
+    var expectedUsbToken: Data?
+
     /// Asked once per connection, on the network queue, right before the
     /// display config would go out: `key` is the tablet's profile key (type 18
     /// UUID, or `name:<handshake name>` for wireless apps that predate it;
@@ -354,13 +360,43 @@ class StreamingServer {
         }
     }
 
+    /// A new connection stays a candidate until it authenticates — only then
+    /// does it replace the active session (see `promote`). Before, any
+    /// incoming connection kicked the current client immediately, so anyone
+    /// who could reach the port could keep disconnecting it.
     private func handleConnection(_ newConnection: NWConnection) {
         debugLog("New connection incoming...")
 
-        // Clean up old connection properly
-        if let oldConnection = connection {
+        newConnection.stateUpdateHandler = { [weak self] state in
+            debugLog("Connection state: \(state)")
+            switch state {
+            case .ready:
+                self?.onConnectionReady(newConnection)
+            case .failed(let error):
+                debugLog("Connection failed: \(error)")
+                if let self = self, self.connection === newConnection {
+                    self.onClientDisconnected?()
+                }
+            case .cancelled:
+                debugLog("Connection cancelled")
+                if let self = self, self.connection === newConnection {
+                    self.onClientDisconnected?()
+                }
+            default:
+                break
+            }
+        }
+
+        newConnection.start(queue: networkQueue)
+    }
+
+    /// Makes an authenticated connection the active session.
+    private func promote(_ newConnection: NWConnection, handshakeName: String?) {
+        if let oldConnection = connection, oldConnection !== newConnection {
             isReceiving = false
+            connection = nil
             oldConnection.cancel()
+            onClientDisconnected?()
         }
 
         connectionReady = false
@@ -370,37 +406,32 @@ class StreamingServer {
         clientDecodeLimitTable = nil
         clientSupportsDesktopGeometry = false
         clientIdentity = nil
-        handshakeDeviceName = nil
+        handshakeDeviceName = handshakeName
         startupPrepared = false
         startupHeld = false
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
         connection = newConnection
         droppedFrames = 0
-
-        connection?.stateUpdateHandler = { [weak self] state in
-            debugLog("Connection state: \(state)")
-            switch state {
-            case .ready:
-                self?.onConnectionReady(newConnection)
-            case .failed(let error):
-                debugLog("Connection failed: \(error)")
-                self?.onClientDisconnected?()
-            case .cancelled:
-                debugLog("Connection cancelled")
-                self?.onClientDisconnected?()
-            default:
-                break
-            }
-        }
-
-        connection?.start(queue: networkQueue)
     }
 
     private func onConnectionReady(_ conn: NWConnection) {
+        // A candidate that hasn't authenticated within the window is dropped,
+        // so idle or half-open connections can't pile up.
+        networkQueue.asyncAfter(deadline: .now() + .seconds(5)) { [weak self, weak conn] in
+            guard let self = self, let conn = conn, self.connection !== conn else { return }
+            if case .cancelled = conn.state { return }
+            debugLog("Dropping connection that did not authenticate in time")
+            conn.cancel()
+        }
         if conn.endpoint.isLoopback {
-            debugLog("Client connected via loopback (USB) — skipping auth")
-            beginExistingProtocol(on: conn)
+            guard let expected = expectedUsbToken else {
+                debugLog("Rejecting loopback client: no USB token configured")
+                conn.cancel()
+                return
+            }
+            debugLog("Client connected via loopback (USB) — running auth handshake")
+            runAuthHandshake(connection: conn, expectedToken: expected, isUsb: true)
             return
         }
         guard let expected = expectedAuthToken else {
@@ -409,7 +440,7 @@ class StreamingServer {
             return
         }
         debugLog("Client connected via LAN — running auth handshake")
-        runAuthHandshake(connection: conn, expectedToken: expected)
+        runAuthHandshake(connection: conn, expectedToken: expected, isUsb: false)
     }
 
     private func beginExistingProtocol(on conn: NWConnection) {
@@ -459,7 +490,7 @@ class StreamingServer {
         onClientConnected?()
     }
 
-    private func runAuthHandshake(connection conn: NWConnection, expectedToken: Data) {
+    private func runAuthHandshake(connection conn: NWConnection, expectedToken: Data, isUsb: Bool) {
         // Read fixed prefix [magic 4][token 32][name_len 1] = 37 bytes.
         conn.receive(minimumIncompleteLength: HandshakeCodec.fixedPrefixLen,
                      maximumLength: HandshakeCodec.fixedPrefixLen) { [weak self] prefixData, _, _, error in
@@ -475,6 +506,12 @@ class StreamingServer {
             }
             let prefixBytes = Array(prefix)
             if Array(prefixBytes[0..<4]) == HandshakeCodec.pairingRequestMagic {
+                // Code pairing hands out the WIRELESS token; it has no business
+                // on the USB path, where any tablet app could try codes.
+                guard !isUsb else {
+                    self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
+                    return
+                }
                 self.runPairingExchange(connection: conn, prefix: prefix)
                 return
             }
@@ -487,14 +524,22 @@ class StreamingServer {
             }) { full in
                 do {
                     let parsed = try HandshakeCodec.parseRequest(full)
-                    if WirelessAuth.validate(parsed.token, expected: expectedToken) {
-                        debugLog("Wireless auth OK — device: \(parsed.deviceName)")
+                    guard !self.isStopped else {
+                        conn.cancel()
+                        return
+                    }
+                    if AuthSecret.validate(parsed.token, expected: expectedToken) {
+                        debugLog("\(isUsb ? "USB" : "Wireless") auth OK — device: \(parsed.deviceName)")
                         self.sendAuthResponse(conn, status: .ok, thenClose: false)
-                        self.handshakeDeviceName = parsed.deviceName
-                        self.onWirelessClientPaired?(parsed.deviceName)
+                        // USB keeps handshakeDeviceName nil, as before, so the
+                        // per-tablet profile key for USB clients is unchanged.
+                        self.promote(conn, handshakeName: isUsb ? nil : parsed.deviceName)
+                        if !isUsb {
+                            self.onWirelessClientPaired?(parsed.deviceName)
+                        }
                         self.beginExistingProtocol(on: conn)
                     } else {
-                        debugLog("Wireless auth rejected: token mismatch")
+                        debugLog("\(isUsb ? "USB" : "Wireless") auth rejected: token mismatch")
                         self.sendAuthResponse(conn, status: .invalidToken, thenClose: true)
                     }
                 } catch HandshakeError.invalidMagic {
@@ -688,7 +733,8 @@ class StreamingServer {
         }
 
         connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self] data, _, isComplete, error in
-            guard let self = self, self.isReceiving, !self.isStopped else { return }
+            // A replaced connection's last read must not touch the new session.
+            guard let self = self, self.isReceiving, !self.isStopped, self.connection === connection else { return }
 
             if error != nil || isComplete {
                 self.isReceiving = false

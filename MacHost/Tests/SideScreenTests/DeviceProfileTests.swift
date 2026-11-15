@@ -114,6 +114,7 @@ final class DeviceProfileStoreTests: XCTestCase {
 /// The server holds a tablet's stream until the host has applied its profile.
 final class StreamingServerProfileHoldTests: XCTestCase {
     private let identity = DeviceIdentity(id: "0f8fad5b-d9cb-469f-a165-70867728950e", name: "Tab S9")
+    private let usbToken = AuthSecret.generate()
 
     private func connect(to server: StreamingServer) async throws -> NWConnection {
         let port = try XCTUnwrap(server.boundPort)
@@ -122,6 +123,19 @@ final class StreamingServerProfileHoldTests: XCTestCase {
         conn.stateUpdateHandler = { if case .ready = $0 { ready.fulfill() } }
         conn.start(queue: DispatchQueue(label: "StreamingServerProfileHoldTests.client"))
         await fulfillment(of: [ready], timeout: 2)
+
+        // USB clients must authenticate before the stream protocol starts.
+        let name = Array("Tab S9".utf8)
+        let request = Data(HandshakeCodec.requestMagic) + usbToken + Data([UInt8(name.count)]) + Data(name)
+        conn.send(content: request, completion: .contentProcessed { _ in })
+        let authed = expectation(description: "auth response")
+        var response: Data?
+        conn.receive(minimumIncompleteLength: 5, maximumLength: 5) { data, _, _, _ in
+            response = data
+            authed.fulfill()
+        }
+        await fulfillment(of: [authed], timeout: 2)
+        XCTAssertEqual(response, HandshakeCodec.encodeResponse(status: .ok))
         return conn
     }
 
@@ -144,6 +158,7 @@ final class StreamingServerProfileHoldTests: XCTestCase {
 
     func testIdentifiedClientIsHeldUntilResumed() async throws {
         let server = StreamingServer(port: 0)
+        server.expectedUsbToken = usbToken
         defer { server.stop() }
         let asked = expectation(description: "prepare asked")
         var seenKey: String?
@@ -177,8 +192,9 @@ final class StreamingServerProfileHoldTests: XCTestCase {
         XCTAssertEqual(first.byte, 1, "display config once resumed")
     }
 
-    func testLegacyUSBClientIsNotHeld() async throws {
+    func testUsbClientWithoutIdentityIsNotHeld() async throws {
         let server = StreamingServer(port: 0)
+        server.expectedUsbToken = usbToken
         defer { server.stop() }
         let asked = expectation(description: "prepare asked")
         var seenKey: String? = "unset"

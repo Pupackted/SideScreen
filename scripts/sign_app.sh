@@ -15,6 +15,10 @@ ENTITLEMENTS="$ROOT_DIR/MacHost/SideScreen.entitlements"
 FLAGS=(--force --options runtime)
 if [ "$IDENTITY" != "-" ]; then
   FLAGS+=(--timestamp)
+else
+  # No Team ID → library validation would block Sparkle.framework. Only ad-hoc
+  # builds get that exemption; identity-signed builds keep full validation.
+  ENTITLEMENTS="$ROOT_DIR/MacHost/SideScreen.adhoc.entitlements"
 fi
 
 SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"

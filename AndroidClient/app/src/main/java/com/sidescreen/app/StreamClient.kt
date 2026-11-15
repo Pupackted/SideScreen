@@ -119,6 +119,47 @@ class StreamClient(
     private val touchDispatcher = touchExecutor.asCoroutineDispatcher()
     private val touchScope = CoroutineScope(touchDispatcher)
 
+    /** USB auth failed; [message] is shown to the user as-is. */
+    class UsbAuthException(message: String) : Exception(message)
+
+    /**
+     * USB clients authenticate with the token the Mac delivered over adb
+     * ([UsbTokenReceiver]), using the same SSWA handshake as wireless.
+     */
+    private fun authenticateUsb(s: Socket) {
+        val token =
+            UsbTokenStore.load(context)
+                ?: throw UsbAuthException(
+                    "This tablet isn't paired with the Mac for USB yet.\n\n" +
+                        "Unplug and replug the USB cable while Side Screen is running on the Mac.",
+                )
+        val deviceName = WirelessTabController.defaultDeviceName(context)
+        s.soTimeout = 5000
+        s.getOutputStream().write(AuthHandshake.encodeRequest(token, deviceName))
+        s.getOutputStream().flush()
+        val response = ByteArray(5)
+        var read = 0
+        while (read < 5) {
+            val r = s.getInputStream().read(response, read, 5 - read)
+            if (r <= 0) break
+            read += r
+        }
+        s.soTimeout = 0
+        when (if (read == 5) AuthHandshake.parseResponse(response) else null) {
+            AuthHandshake.ResponseStatus.OK -> Unit
+            AuthHandshake.ResponseStatus.INVALID_TOKEN ->
+                throw UsbAuthException(
+                    "The Mac rejected this tablet's USB token.\n\n" +
+                        "Unplug and replug the USB cable to pair again.",
+                )
+            else ->
+                throw UsbAuthException(
+                    "The Mac didn't accept the USB handshake.\n\n" +
+                        "Make sure the Mac runs the same Side Screen build as this tablet.",
+                )
+        }
+    }
+
     suspend fun connect() =
         withContext(Dispatchers.IO) {
             try {
@@ -126,6 +167,7 @@ class StreamClient(
                     Socket(host, port).apply {
                         tcpNoDelay = true
                     }
+                authenticateUsb(socket!!)
                 inputStream = DataInputStream(java.io.BufferedInputStream(socket?.getInputStream(), 65536))
                 outputStream = java.io.DataOutputStream(socket?.getOutputStream())
                 streamCodecIsHevc = true
@@ -146,6 +188,11 @@ class StreamClient(
                 onConnectionStatus?.invoke(true)
 
                 receiveData()
+            } catch (e: UsbAuthException) {
+                Log.e(TAG, "❌ USB auth failed: ${e.message}")
+                onConnectionStatus?.invoke(false)
+                cleanup()
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "❌ Connection error", e)
                 onConnectionStatus?.invoke(false)

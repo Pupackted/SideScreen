@@ -58,7 +58,7 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
 </plist>
 EOF
 
-codesign --force --deep --sign - --entitlements "$ROOT_DIR/MacHost/SideScreen.entitlements" "$APP_DIR" 2>/dev/null
+codesign --force --deep --sign - --entitlements "$ROOT_DIR/MacHost/SideScreen.adhoc.entitlements" "$APP_DIR" 2>/dev/null
 echo "  OK"
 
 # 3. Build Android

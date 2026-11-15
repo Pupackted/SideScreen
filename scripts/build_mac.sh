@@ -79,12 +79,6 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <string>13.0</string>
     <key>LSUIElement</key>
     <false/>
-    <key>SUFeedURL</key>
-    <string>https://github.com/tranvuongquocdat/SideScreen/releases/latest/download/appcast.xml</string>
-    <key>SUPublicEDKey</key>
-    <string>7bJdS/tTNvOEUEobUTrH7IxJsg/FBZcmSHyzY4ZU97I=</string>
-    <key>SUEnableAutomaticChecks</key>
-    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
