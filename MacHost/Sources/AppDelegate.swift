@@ -76,9 +76,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// the refresh-rate observer skip restarts that would change nothing.
     private var lastAppliedRefreshRate: Int?
     var isDaemonMode = false // Deprecated: keeping variable for ABI compatibility but unused
+    /// Whether an adb server was already running when SideScreen launched.
+    /// If not, our first adb call (status polling, USB setup) starts one; adb's
+    /// server daemonizes and outlives us, so macOS keeps showing SideScreen as
+    /// "Running in Background" after quit. On quit we stop only a server we started.
+    private var adbServerWasRunningAtLaunch = true
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("✅ App launched")
+
+        // Must run before anything below can call adb and start a server.
+        adbServerWasRunningAtLaunch = StatusDetector.adbServerRunning()
 
         // Create menu bar item
         setupMenuBar()
@@ -461,6 +469,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         debugLog("🔌 setupADBReverse() invoked for port \(port)...")
 
         await Task.detached(priority: .utility) {
+            // Counted as one adb call so quit waits for it (see StatusDetector quit gate).
+            guard StatusDetector.beginAdbCall() else { return }
+            defer { StatusDetector.endAdbCall() }
             guard let adbPath = StatusDetector.adbExecutablePath() else {
                 print("⚠️  ADB not found - USB connection may not work")
                 print("💡 Install Android SDK or run manually: adb reverse tcp:\(port) tcp:\(port)")
@@ -1326,8 +1337,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Stop server and cleanup
         stopServer()
 
+        // Don't leave adb running behind us
+        cleanUpADB()
+
         // Cancel all combine subscriptions
         cancellables.removeAll()
+    }
+
+    /// Quit-time adb cleanup. A server we started gets stopped (that also drops
+    /// our reverses), unless another adb client is using it right now (e.g. an
+    /// `adb push` mid-transfer). A server that was already running belongs to
+    /// someone else (Android Studio, a terminal): we leave it up and only
+    /// remove our reverse.
+    private func cleanUpADB() {
+        statusRefreshTimer?.invalidate()
+        statusRefreshTimer = nil
+        // Block new polling calls and let running ones finish, so none of them
+        // can restart the server right after we stop it.
+        StatusDetector.beginShutdown()
+        guard StatusDetector.adbExecutablePath() != nil,
+              StatusDetector.adbServerRunning() else { return }
+        let removeOurReverses = {
+            for serial in StatusDetector.usbDevices(duringShutdown: true) {
+                StatusDetector.runAdb(["-s", serial, "reverse", "--remove", "tcp:\(self.settings.port)"])
+            }
+        }
+        if adbServerWasRunningAtLaunch {
+            removeOurReverses()
+        } else if StatusDetector.otherAdbClientsRunning() {
+            removeOurReverses()
+            debugLog("Left the adb server running: another adb client is using it")
+        } else {
+            StatusDetector.runAdb(["kill-server"])
+            debugLog("Stopped the adb server SideScreen started")
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
